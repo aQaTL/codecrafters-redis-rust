@@ -85,6 +85,7 @@ enum RESPMsg<'a> {
 }
 
 impl RESPMsg<'_> {
+	#[allow(dead_code)]
 	fn write_to(&self, w: &mut impl Write) -> io::Result<usize> {
 		match self {
 			RESPMsg::SimpleString(v) => v.write_to(w),
@@ -169,6 +170,7 @@ impl BulkString<'_> {
 struct RESPArray<'a>(Vec<RESPMsg<'a>>);
 
 impl RESPArray<'_> {
+	#[allow(dead_code)]
 	fn write_to(&self, w: &mut impl Write) -> io::Result<usize> {
 		let header = format!("*{}\r\n", self.0.len());
 		w.write_all(header.as_bytes())?;
