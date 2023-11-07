@@ -23,16 +23,24 @@ fn main() {
 
 fn handle_connection(mut stream: TcpStream) {
 	let mut input = vec![0_u8; 256];
-	let read_bytes = stream.read(&mut input).unwrap();
-	unsafe {
-		input.set_len(read_bytes);
+	loop {
+		unsafe {
+			input.set_len(256);
+		};
+		let read_bytes = stream.read(&mut input).unwrap();
+		if read_bytes == 0 {
+			break;
+		}
+		unsafe {
+			input.set_len(read_bytes);
+		}
+
+		let input_str = std::str::from_utf8(&input).unwrap();
+
+		println!("input({read_bytes}): \"{input_str}\"");
+		PONG_RESPONSE.write_to(&mut stream).unwrap();
+		stream.flush().unwrap();
 	}
-
-	let input_str = std::str::from_utf8(&input).unwrap();
-
-	println!("input({read_bytes}): \"{input_str}\"");
-	PONG_RESPONSE.write_to(&mut stream).unwrap();
-	stream.flush().unwrap();
 	println!("closing connection");
 }
 
