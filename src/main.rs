@@ -44,7 +44,7 @@ fn handle_connection(mut stream: TcpStream) {
 				match &arr[0] {
 					RESPMsg::BulkString(BulkString(str)) => {
 						match str as &str {
-							"ECHO" => {
+							"ECHO" | "echo" => {
 								let RESPMsg::BulkString(payload) = &arr[1] else {
 									panic!();
 								};
