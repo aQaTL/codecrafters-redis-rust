@@ -43,15 +43,20 @@ fn handle_connection(mut stream: TcpStream) {
 			RESPMsg::Array(RESPArray(arr)) => {
 				match &arr[0] {
 					RESPMsg::BulkString(BulkString(str)) => {
-						if str != "ECHO" {
-							panic!();
-						}
-						let RESPMsg::BulkString(payload) = &arr[1] else {
-							panic!();
-						};
+						match str as &str {
+							"ECHO" => {
+								let RESPMsg::BulkString(payload) = &arr[1] else {
+									panic!();
+								};
 
-						// Echo back the same thing
-						payload.write_to(&mut stream).unwrap();
+								// Echo back the same thing
+								payload.write_to(&mut stream).unwrap();
+							}
+							"ping" => {
+								PONG_RESPONSE.write_to(&mut stream).unwrap();
+							}
+							_ => panic!(),
+						}
 					}
 					RESPMsg::SimpleString(SimpleString(str)) => {
 						if str != "PING" {
