@@ -157,7 +157,7 @@ impl<R: Read> RESPMsgReader<R> {
 			b'$' => Ok(Some(RESPMsg::BulkString(self.decode_bulk_string()?))),
 			b'+' => Ok(Some(RESPMsg::SimpleString(self.decode_simple_string()?))),
 			b'_' => Ok(Some(self.decode_null()?)),
-			v => panic!("unimplemented type `{v}`"),
+			v => panic!("unimplemented type `{}`", *v as char),
 		}
 	}
 
@@ -232,7 +232,7 @@ impl<R: Read> RESPMsgReader<R> {
 
 			let str: String = std::str::from_utf8(
 				&self.stream.fill_buf()
-					[(self.current_position + 1)..(self.current_position + 1 + str_end_idx)],
+					[(self.current_position + 1)..(self.current_position + str_end_idx)],
 			)
 			.unwrap()
 			.to_string();
@@ -527,6 +527,77 @@ mod tests {
 			RESPMsg::BulkString(BulkString("ECHO".into())),
 			RESPMsg::BulkString(BulkString("hey".into())),
 		]));
+		let result = RESPMsgReader::new(msg.as_slice())
+			.next_msg()
+			.unwrap()
+			.unwrap();
+		assert_eq!(result, expected);
+	}
+
+	#[test]
+	fn test_decode_multiple_messages_from_reader() {
+		let msg1 = b"*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n";
+		let msg2 = b"*2\r\n$15\r\nAla nie ma kota\r\n$3\r\nhey\r\n";
+		let msg3 = b"*2\r\n+FOOBAR\r\n$3\r\nhey\r\n";
+		let msg4 = b"*3\r\n$4\r\nECHO\r\n_\r\n$3\r\nhey\r\n";
+		let expected1 = RESPMsg::Array(RESPArray(vec![
+			RESPMsg::BulkString(BulkString("ECHO".into())),
+			RESPMsg::BulkString(BulkString("hey".into())),
+		]));
+		let expected2 = RESPMsg::Array(RESPArray(vec![
+			RESPMsg::BulkString(BulkString("Ala nie ma kota".into())),
+			RESPMsg::BulkString(BulkString("hey".into())),
+		]));
+		let expected3 = RESPMsg::Array(RESPArray(vec![
+			RESPMsg::SimpleString(SimpleString("FOOBAR".into())),
+			RESPMsg::BulkString(BulkString("hey".into())),
+		]));
+		let expected4 = RESPMsg::Array(RESPArray(vec![
+			RESPMsg::BulkString(BulkString("ECHO".into())),
+			RESPMsg::Null,
+			RESPMsg::BulkString(BulkString("hey".into())),
+		]));
+
+		let result = RESPMsgReader::new(msg1.as_slice())
+			.next_msg()
+			.unwrap()
+			.unwrap();
+		assert_eq!(result, expected1);
+
+		let result = RESPMsgReader::new(msg2.as_slice())
+			.next_msg()
+			.unwrap()
+			.unwrap();
+		assert_eq!(result, expected2);
+
+		let result = RESPMsgReader::new(msg3.as_slice())
+			.next_msg()
+			.unwrap()
+			.unwrap();
+		assert_eq!(result, expected3);
+
+		let result = RESPMsgReader::new(msg4.as_slice())
+			.next_msg()
+			.unwrap()
+			.unwrap();
+		assert_eq!(result, expected4);
+	}
+
+	#[test]
+	fn test_decode_simple_message_from_reader() {
+		let msg = b"+ala ma kota\r\n";
+		let expected = RESPMsg::SimpleString(SimpleString("ala ma kota".into()));
+		let result = RESPMsgReader::new(msg.as_slice())
+			.next_msg()
+			.unwrap()
+			.unwrap();
+		assert_eq!(result, expected);
+	}
+
+	#[test]
+	fn test_decode_empty_array_from_reader() {
+		let msg = b"*0\r\n";
+		let expected = RESPMsg::Array(RESPArray(Vec::new()));
 		let result = RESPMsgReader::new(msg.as_slice())
 			.next_msg()
 			.unwrap()
