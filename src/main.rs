@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::{Arc, RwLock};
@@ -74,6 +74,193 @@ fn handle_connection(mut stream: TcpStream, db: Arc<Db>) {
 	println!("closing connection");
 }
 
+struct BufReader<R> {
+	stream: R,
+	buffer: Vec<u8>,
+}
+
+impl<R: Read> BufReader<R> {
+	fn new(stream: R) -> Self {
+		BufReader {
+			stream,
+			buffer: Vec::new(),
+		}
+	}
+
+	fn read_more(&mut self) -> io::Result<()> {
+		const MSG_LEN: usize = 1024;
+
+		let current_len = self.buffer.len();
+		self.buffer.resize(current_len + MSG_LEN, 0_u8);
+
+		let new_buf_space = &mut self.buffer[current_len..(current_len + MSG_LEN)];
+		let bytes_read = self.stream.read(new_buf_space)?;
+
+		unsafe {
+			self.buffer.set_len(current_len + bytes_read);
+		}
+
+		Ok(())
+	}
+
+	fn fill_buf(&mut self) -> &[u8] {
+		&self.buffer
+	}
+
+	fn consume(&mut self, amt: usize) {
+		if amt == 0 {
+			return;
+		}
+		let buf_ptr = self.buffer.as_mut_ptr();
+		let buf_to_copy = &self.buffer[amt..];
+		unsafe {
+			for (idx, b) in buf_to_copy.iter().copied().enumerate() {
+				*buf_ptr.add(idx) = b;
+			}
+
+			self.buffer.set_len(buf_to_copy.len());
+		}
+	}
+}
+
+struct RESPMsgReader<R> {
+	stream: BufReader<R>,
+	current_position: usize,
+}
+
+impl<R: Read> RESPMsgReader<R> {
+	pub fn new(stream: R) -> Self {
+		RESPMsgReader {
+			stream: BufReader::new(stream),
+			current_position: 0,
+		}
+	}
+
+	pub fn next_msg(&mut self) -> io::Result<Option<RESPMsg<'static>>> {
+		let msg = self.next_msg_();
+		self.stream.consume(self.current_position);
+		self.current_position = 0;
+		msg
+	}
+
+	fn next_msg_(&mut self) -> io::Result<Option<RESPMsg<'static>>> {
+		if self.stream.fill_buf().is_empty()
+			|| self.stream.fill_buf().len() == self.current_position
+		{
+			self.stream.read_more()?;
+		}
+		let Some(msg_type) = self.stream.fill_buf().get(self.current_position) else {
+			return Ok(None);
+		};
+		match msg_type {
+			b'*' => Ok(Some(RESPMsg::Array(self.decode_array()?))),
+			b'$' => Ok(Some(RESPMsg::BulkString(self.decode_bulk_string()?))),
+			b'+' => Ok(Some(RESPMsg::SimpleString(self.decode_simple_string()?))),
+			b'_' => Ok(Some(self.decode_null()?)),
+			v => panic!("unimplemented type `{v}`"),
+		}
+	}
+
+	fn decode_array(&mut self) -> io::Result<RESPArray<'static>> {
+		loop {
+			let Some(len_end_idx) = find_crlf_idx(&self.stream.fill_buf()[self.current_position..])
+			else {
+				self.stream.read_more()?;
+				continue;
+			};
+			let length: usize = std::str::from_utf8(
+				&self.stream.fill_buf()
+					[(self.current_position + 1)..(self.current_position + len_end_idx)],
+			)
+			.unwrap()
+			.parse()
+			.unwrap();
+
+			self.current_position += len_end_idx + 2;
+
+			let mut vec: Vec<RESPMsg<'static>> = Vec::with_capacity(length);
+			for _ in 0..length {
+				let msg: RESPMsg<'static> = self.next_msg_()?.unwrap();
+				vec.push(msg);
+			}
+			return Ok(RESPArray(vec));
+		}
+	}
+
+	fn decode_bulk_string(&mut self) -> io::Result<BulkString<'static>> {
+		loop {
+			let Some(len_end_idx) = find_crlf_idx(&self.stream.fill_buf()[self.current_position..])
+			else {
+				self.stream.read_more()?;
+				continue;
+			};
+			let length: usize = std::str::from_utf8(
+				&self.stream.fill_buf()
+					[(self.current_position + 1)..(self.current_position + len_end_idx)],
+			)
+			.unwrap()
+			.parse()
+			.unwrap();
+
+			let data_start_idx = len_end_idx + 2;
+			let Some(data_end_idx) =
+				find_crlf_idx(&self.stream.fill_buf()[(self.current_position + data_start_idx)..])
+			else {
+				self.stream.read_more()?;
+				continue;
+			};
+			let actual_data_len = data_end_idx;
+			assert_eq!(actual_data_len, length);
+			let data_end_idx = data_start_idx + data_end_idx;
+
+			let data = &self.stream.fill_buf()
+				[(self.current_position + data_start_idx)..(self.current_position + data_end_idx)];
+			let str: String = std::str::from_utf8(data).unwrap().to_string();
+
+			self.current_position += data_end_idx + 2;
+			return Ok(BulkString(Cow::Owned(str)));
+		}
+	}
+
+	fn decode_simple_string(&mut self) -> io::Result<SimpleString<'static>> {
+		loop {
+			let Some(str_end_idx) = find_crlf_idx(&self.stream.fill_buf()[self.current_position..])
+			else {
+				self.stream.read_more()?;
+				continue;
+			};
+
+			let str: String = std::str::from_utf8(
+				&self.stream.fill_buf()
+					[(self.current_position + 1)..(self.current_position + 1 + str_end_idx)],
+			)
+			.unwrap()
+			.to_string();
+
+			self.current_position += str_end_idx + 2;
+
+			return Ok(SimpleString(Cow::Owned(str)));
+		}
+	}
+
+	fn decode_null(&mut self) -> io::Result<RESPMsg<'static>> {
+		while (self.stream.fill_buf().len() - self.current_position) < 3 {
+			self.stream.read_more()?;
+		}
+		let Some(msg) = (&self.stream.fill_buf()
+			[(self.current_position + 1)..(self.current_position + 3)]
+			== b"\r\n")
+			.then_some(RESPMsg::Null)
+		else {
+			panic!()
+		};
+
+		self.current_position += 3;
+
+		Ok(msg)
+	}
+}
+
 fn handle_ping(stream: &mut TcpStream) {
 	PONG_RESPONSE.write_to(stream).unwrap();
 }
@@ -88,6 +275,7 @@ fn handle_echo(stream: &mut TcpStream, payload: &RESPMsg<'_>) {
 }
 
 fn handle_set(stream: &mut TcpStream, db: &Arc<Db>, payload: &[RESPMsg<'_>]) {
+	// let options = SetCommand::new(payload);
 	if payload.len() > 2 {
 		eprintln!("[WARN] Received more than <key> <value>. Ignoring that.");
 	}
@@ -102,6 +290,14 @@ fn handle_set(stream: &mut TcpStream, db: &Arc<Db>, payload: &[RESPMsg<'_>]) {
 
 	let response = SimpleString("OK".into());
 	response.write_to(stream).unwrap();
+}
+
+struct SetCommand {}
+
+impl SetCommand {
+	fn new(payload: &[RESPMsg<'_>]) -> Self {
+		todo!()
+	}
 }
 
 fn handle_get(stream: &mut TcpStream, db: &Arc<Db>, payload: &[RESPMsg<'_>]) {
@@ -321,6 +517,20 @@ mod tests {
 			RESPMsg::BulkString(BulkString("hey".into())),
 		]));
 		let result = RESPMsg::from_slice(msg);
+		assert_eq!(result, expected);
+	}
+
+	#[test]
+	fn test_decode_from_reader() {
+		let msg = b"*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n";
+		let expected = RESPMsg::Array(RESPArray(vec![
+			RESPMsg::BulkString(BulkString("ECHO".into())),
+			RESPMsg::BulkString(BulkString("hey".into())),
+		]));
+		let result = RESPMsgReader::new(msg.as_slice())
+			.next_msg()
+			.unwrap()
+			.unwrap();
 		assert_eq!(result, expected);
 	}
 }
