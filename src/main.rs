@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::{Arc, RwLock};
@@ -272,6 +272,7 @@ where
 	let options = SetCommand::new(payload);
 
 	{
+		println!("Expiry: {:?}", options.expiry);
 		db.hm.write().unwrap().insert(
 			options.key.0.into_owned(),
 			Value {
@@ -384,6 +385,7 @@ impl RESPMsg<'_> {
 		}
 	}
 
+	#[allow(dead_code)]
 	fn from_slice<'a>(mut input: &'a [u8]) -> RESPMsg<'a> {
 		let slice: &mut &'a [u8] = &mut input;
 		Self::decode(slice)
@@ -454,6 +456,7 @@ impl BulkString<'_> {
 		Ok(header.len() + self.0.len() + 2)
 	}
 
+	#[allow(dead_code)]
 	fn decode<'a, 'b>(input: &'b mut &'a [u8]) -> BulkString<'a>
 	where
 		'a: 'b,
@@ -497,6 +500,7 @@ impl RESPArray<'_> {
 		Ok(header.len() + written)
 	}
 
+	#[allow(dead_code)]
 	fn decode<'a, 'b>(input: &'b mut &'a [u8]) -> RESPArray<'a>
 	where
 		'a: 'b,
