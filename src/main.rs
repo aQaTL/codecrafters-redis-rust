@@ -308,7 +308,7 @@ impl SetCommand<'_> {
 
 		while let Some(msg) = payload.next() {
 			match msg {
-				RESPMsg::BulkString(BulkString(str)) if str == "PX" => {
+				RESPMsg::BulkString(BulkString(str)) if str.eq_ignore_ascii_case("PX") => {
 					let expiry_millis: u64 = match payload.next().unwrap() {
 						RESPMsg::BulkString(BulkString(expiry)) => expiry.parse().unwrap(),
 						msg => panic!("{msg:?}"),
