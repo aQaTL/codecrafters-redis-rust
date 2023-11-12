@@ -4,6 +4,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 fn main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -28,48 +29,33 @@ fn main() {
 
 #[derive(Default)]
 struct Db {
-	hm: RwLock<HashMap<String, RESPMsg<'static>>>,
+	hm: RwLock<HashMap<String, Value>>,
 }
 
-fn handle_connection(mut stream: TcpStream, db: Arc<Db>) {
-	let mut input = vec![0_u8; 256];
-	loop {
-		unsafe {
-			input.set_len(256);
-		};
-		let read_bytes = stream.read(&mut input).unwrap();
-		if read_bytes == 0 {
-			break;
-		}
-		unsafe {
-			input.set_len(read_bytes);
-		}
-
-		// println!("input({read_bytes}): \"{input_str}\"");
-		let message = RESPMsg::from_slice(input.as_slice());
-		println!("input: {message:#?}");
-
+fn handle_connection(stream: TcpStream, db: Arc<Db>) {
+	let mut stream = RESPMsgReader::new(stream);
+	while let Some(message) = stream.next_msg().unwrap() {
 		match message {
 			RESPMsg::Array(RESPArray(arr)) => match &arr[0] {
 				RESPMsg::BulkString(BulkString(str)) => {
 					let command = str.to_ascii_lowercase();
 					match command.as_str() {
-						"echo" => handle_echo(&mut stream, &arr[1]),
-						"ping" => handle_ping(&mut stream),
-						"set" => handle_set(&mut stream, &db, &arr[1..]),
-						"get" => handle_get(&mut stream, &db, &arr[1..]),
+						"echo" => handle_echo(stream.get_mut(), &arr[1]),
+						"ping" => handle_ping(stream.get_mut()),
+						"set" => handle_set(stream.get_mut(), &db, arr.into_iter().skip(1)),
+						"get" => handle_get(stream.get_mut(), &db, &arr[1..]),
 						_ => panic!("unknown command: {command}"),
 					}
 				}
 				RESPMsg::SimpleString(SimpleString(str)) if str.eq_ignore_ascii_case("ping") => {
-					handle_ping(&mut stream);
+					handle_ping(stream.get_mut());
 				}
 				_ => panic!(),
 			},
 			_ => unimplemented!(),
 		}
 
-		stream.flush().unwrap();
+		stream.get_mut().flush().unwrap();
 	}
 	println!("closing connection");
 }
@@ -134,6 +120,10 @@ impl<R: Read> RESPMsgReader<R> {
 			stream: BufReader::new(stream),
 			current_position: 0,
 		}
+	}
+
+	pub fn get_mut(&mut self) -> &mut R {
+		&mut self.stream.stream
 	}
 
 	pub fn next_msg(&mut self) -> io::Result<Option<RESPMsg<'static>>> {
@@ -261,11 +251,11 @@ impl<R: Read> RESPMsgReader<R> {
 	}
 }
 
-fn handle_ping(stream: &mut TcpStream) {
+fn handle_ping<W: Write>(stream: &mut W) {
 	PONG_RESPONSE.write_to(stream).unwrap();
 }
 
-fn handle_echo(stream: &mut TcpStream, payload: &RESPMsg<'_>) {
+fn handle_echo<W: Write>(stream: &mut W, payload: &RESPMsg<'_>) {
 	let RESPMsg::BulkString(payload) = payload else {
 		panic!();
 	};
@@ -274,33 +264,65 @@ fn handle_echo(stream: &mut TcpStream, payload: &RESPMsg<'_>) {
 	payload.write_to(stream).unwrap();
 }
 
-fn handle_set(stream: &mut TcpStream, db: &Arc<Db>, payload: &[RESPMsg<'_>]) {
-	// let options = SetCommand::new(payload);
-	if payload.len() > 2 {
-		eprintln!("[WARN] Received more than <key> <value>. Ignoring that.");
-	}
-	let RESPMsg::BulkString(BulkString(key)) = &payload[0] else {
-		panic!();
-	};
-	let value = payload[1].clone();
+fn handle_set<W, I>(stream: &mut W, db: &Arc<Db>, payload: I)
+where
+	W: Write,
+	I: Iterator<Item = RESPMsg<'static>>,
+{
+	let options = SetCommand::new(payload);
 
 	{
-		db.hm.write().unwrap().insert(key.to_string(), value);
+		db.hm.write().unwrap().insert(
+			options.key.0.into_owned(),
+			Value {
+				value: options.value,
+				expires_at: options.expiry.map(|expiry| Instant::now() + expiry),
+			},
+		);
 	}
 
 	let response = SimpleString("OK".into());
 	response.write_to(stream).unwrap();
 }
 
-struct SetCommand {}
+struct Value {
+	value: RESPMsg<'static>,
+	expires_at: Option<Instant>,
+}
 
-impl SetCommand {
-	fn new(payload: &[RESPMsg<'_>]) -> Self {
-		todo!()
+struct SetCommand<'a> {
+	key: BulkString<'a>,
+	value: RESPMsg<'a>,
+	expiry: Option<Duration>,
+}
+
+impl SetCommand<'_> {
+	fn new(mut payload: impl Iterator<Item = RESPMsg<'static>>) -> Self {
+		let RESPMsg::BulkString(key) = payload.next().unwrap() else {
+			panic!();
+		};
+		let value = payload.next().unwrap().clone();
+
+		let mut expiry = None;
+
+		while let Some(msg) = payload.next() {
+			match msg {
+				RESPMsg::BulkString(BulkString(str)) if str == "PX" => {
+					let expiry_millis: u64 = match payload.next().unwrap() {
+						RESPMsg::BulkString(BulkString(expiry)) => expiry.parse().unwrap(),
+						msg => panic!("{msg:?}"),
+					};
+					expiry = Some(Duration::from_millis(expiry_millis));
+				}
+				_ => (),
+			}
+		}
+
+		SetCommand { key, value, expiry }
 	}
 }
 
-fn handle_get(stream: &mut TcpStream, db: &Arc<Db>, payload: &[RESPMsg<'_>]) {
+fn handle_get<W: Write>(stream: &mut W, db: &Arc<Db>, payload: &[RESPMsg<'_>]) {
 	if payload.len() > 1 {
 		eprintln!("[WARN] Received more than <key>. Ignoring that.");
 	}
@@ -311,9 +333,20 @@ fn handle_get(stream: &mut TcpStream, db: &Arc<Db>, payload: &[RESPMsg<'_>]) {
 	let db = db.hm.read().unwrap();
 	let value = db.get(key as &str);
 	let response = match value {
-		Some(
-			RESPMsg::BulkString(BulkString(value)) | RESPMsg::SimpleString(SimpleString(value)),
-		) => RESPMsg::BulkString(BulkString(Cow::Borrowed(value))),
+		Some(Value {
+			value:
+				RESPMsg::BulkString(BulkString(value)) | RESPMsg::SimpleString(SimpleString(value)),
+			expires_at,
+		}) => {
+			if expires_at
+				.map(|expires_at| Instant::now() > expires_at)
+				.unwrap_or_default()
+			{
+				RESPMsg::NullBulkString
+			} else {
+				RESPMsg::BulkString(BulkString(Cow::Borrowed(value)))
+			}
+		}
 		None => RESPMsg::Null,
 		_ => panic!(),
 	};
@@ -328,6 +361,7 @@ const PONG_RESPONSE: SimpleString<'static> = SimpleString(Cow::Borrowed("PONG"))
 enum RESPMsg<'a> {
 	SimpleString(SimpleString<'a>),
 	BulkString(BulkString<'a>),
+	NullBulkString,
 	Array(RESPArray<'a>),
 	Null,
 }
@@ -338,6 +372,10 @@ impl RESPMsg<'_> {
 		match self {
 			RESPMsg::SimpleString(v) => v.write_to(w),
 			RESPMsg::BulkString(v) => v.write_to(w),
+			RESPMsg::NullBulkString => {
+				w.write_all(b"$-1\r\n")?;
+				Ok(5)
+			}
 			RESPMsg::Array(v) => v.write_to(w),
 			RESPMsg::Null => {
 				w.write_all(b"_\r\n")?;
@@ -368,6 +406,7 @@ impl RESPMsg<'_> {
 		match self {
 			RESPMsg::SimpleString(v) => RESPMsg::SimpleString(v.clone()),
 			RESPMsg::BulkString(v) => RESPMsg::BulkString(v.clone()),
+			RESPMsg::NullBulkString => RESPMsg::NullBulkString,
 			RESPMsg::Array(v) => {
 				let arr: RESPArray<'static> = v.clone_manually();
 				RESPMsg::Array(arr)
